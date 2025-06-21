@@ -1,0 +1,331 @@
+// === Wordlist işlemleri ===
+let wordList = [];
+
+async function yasuo() {
+  try {
+    const response = await fetch('https://raw.githubusercontent.com/clanu5/jockey-cheat/refs/heads/main/5%20harf%20%20(1).txt'); // Kelime listesinin URL'si
+    if (!response.ok) throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+    const text = await response.text();
+    wordList = text
+      .split('\n')
+      .map(w => w.trim().toLowerCase())
+      .filter(w => w.length === 5);
+    console.log(`✅ ${wordList.length} kelime yüklendi!`);
+  } catch (error) {
+    console.error('❌ Kelime listesi yüklenirken bir hata oluştu:', error);
+  }
+}
+
+// Sayfa yüklenmesini beklemeden hemen çağırıyoruz
+yasuo();
+
+// === Wordle çözüm fonksiyonları ===
+function parseGameBoardFromHTML(html) {
+  const div = document.createElement('div');
+  div.innerHTML = html;
+  const items = Array.from(div.querySelectorAll('.wolfdlebot-mp-game__content__container__item'));
+  const grid = [];
+
+  for (let i = 0; i < items.length; i += 5) {
+    const row = items.slice(i, i + 5).map(item => {
+      return {
+        letter: item.textContent.toLowerCase(),
+        status: item.classList.contains('correct') ? 'correct' :
+                item.classList.contains('incorrect') ? 'present' :
+                item.classList.contains('invalid') ? 'absent' : 'empty'
+      };
+    });
+    grid.push(row);
+  }
+
+  return grid;
+}
+
+function filterPossibleWords(board, words) {
+  const guessed = board.filter(row => row.some(cell => cell.status !== 'empty'));
+  if (guessed.length === 0) return words;
+
+  return words.filter(word => {
+    return guessed.every(row => {
+      for (let i = 0; i < 5; i++) {
+        const cell = row[i];
+        const letter = word[i];
+
+        if (cell.status === 'correct' && letter !== cell.letter) return false;
+        if (cell.status === 'present') {
+          if (!word.includes(cell.letter) || word[i] === cell.letter) return false;
+        }
+        if (cell.status === 'absent') {
+          const usedElsewhere = guessed.some(r => r.some((c, j) =>
+            j !== i && c.letter === cell.letter && (c.status === 'correct' || c.status === 'present')));
+          if (!usedElsewhere && word.includes(cell.letter)) return false;
+        }
+      }
+      return true;
+    });
+  });
+}
+
+// === Bot ayarları ===
+let targetGroupId = 81853272;
+let client = PalringoWebConnection;
+let isListening = false;
+
+let lastGuessTime = 0;
+let lastGuessWord = '';
+let guessCount = 0;
+let sending = false;
+let waitingForNewGame = false;
+let gameOver = false;
+let noMessageTimer = null;
+
+const spamWords = ["aaaaa", "ggggg", "ttttt", "ppppp"];
+let spamIndex = 0;
+let spamInterval = null;
+
+// !wo sayaçları
+let woCount = 0;
+let lastWoTime = 0;
+
+// Oyun sayaç değişkeni
+let oyunSayaci = 0;
+
+// Toplam puan değişkeni
+let toplamPuan = 0;
+
+// Rastgele kelime spam kontrolü
+let randomWordSpamActive = false;
+let randomWordSpamInterval = null;
+
+// Mesaj gönderme fonksiyonu
+let _sendMessage = (targetId, content, isGroup) => {
+  let packet = {
+    body: {
+      recipient: targetId,
+      isGroup: isGroup,
+      mimeType: 'text/plain',
+      data: new TextEncoder().encode(content).buffer,
+      flightId: Math.random().toString(36).substring(7),
+    }
+  };
+  return client.socket.emit('message send', packet);
+};
+
+let sendGroupMessage = (targetId, content) => _sendMessage(targetGroupId, content, true);
+
+function delay(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function sendGuessWithCooldown(guess) {
+  guess = guess.toLowerCase();
+
+  if (sending) return;
+  if (guess === lastGuessWord) return;
+  if (guessCount >= 6) return;
+
+  sending = true;
+
+  const now = Date.now();
+  const elapsed = now - lastGuessTime;
+  const waitTime = Math.max(2500, 3500 - elapsed);
+
+  if (waitTime > 0) await delay(waitTime);
+
+  if (waitingForNewGame || gameOver) {
+    sending = false;
+    return;
+  }
+
+  sendGroupMessage(targetGroupId, guess);
+  lastGuessTime = Date.now();
+  lastGuessWord = guess;
+  guessCount++;
+  resetNoMessageTimer();
+
+  sending = false;
+}
+
+// Rastgele kelime spam başlat
+function startRandomWordSpam() {
+  if (randomWordSpamActive) return;
+  randomWordSpamActive = true;
+  randomWordSpamInterval = setInterval(() => {
+    if (!randomWordSpamActive || gameOver || waitingForNewGame) return;
+    if (wordList.length > 0) {
+      const randIndex = Math.floor(Math.random() * wordList.length);
+      const randomWord = wordList[randIndex];
+      sendGroupMessage(targetGroupId, randomWord);
+    } else {
+      sendGroupMessage(targetGroupId, "kelime yok");
+    }
+  }, 10000);
+}
+
+// Rastgele kelime spam durdur
+function stopRandomWordSpam() {
+  randomWordSpamActive = false;
+  if (randomWordSpamInterval) {
+    clearInterval(randomWordSpamInterval);
+    randomWordSpamInterval = null;
+  }
+}
+
+// !wo spam kontrolü ve wordlist'ten rastgele kelime gönderimi
+function resetNoMessageTimer() {
+  if (noMessageTimer) clearTimeout(noMessageTimer);
+  noMessageTimer = setTimeout(() => {
+    const now = Date.now();
+    if (now - lastWoTime > 30000) { // 30 saniyeden fazla geçtiyse sayaç sıfırlansın
+      woCount = 0;
+    }
+    if (woCount < 5) {
+      sendGroupMessage(targetGroupId, "!wo");
+      woCount++;
+      lastWoTime = now;
+    } else {
+      // 5. !wo'dan sonra spam başlat
+      startRandomWordSpam();
+      woCount = 0;
+      lastWoTime = now;
+    }
+    resetNoMessageTimer();
+  }, 10000);
+}
+
+function startSpamEndGame() {
+  if (spamInterval) return;
+
+  spamIndex = 0;
+  spamInterval = setInterval(() => {
+    if (gameOver || waitingForNewGame) {
+      clearInterval(spamInterval);
+      spamInterval = null;
+      return;
+    }
+    if (spamIndex >= spamWords.length) spamIndex = 0;
+    sendGroupMessage(targetGroupId, spamWords[spamIndex]);
+    spamIndex++;
+  }, 5000);
+}
+
+function stopSpamEndGame() {
+  if (spamInterval) {
+    clearInterval(spamInterval);
+    spamInterval = null;
+  }
+}
+
+// === Bot dinleyici ===
+if (!isListening) {
+  client.socket.on('message send', async function (data) {
+    let message = data.body;
+    message.text = new TextDecoder().decode(message.data).trim();
+
+    if (message.originator === 82641759 && message.recipient === targetGroupId) {
+      resetNoMessageTimer();
+
+      if (message.mimeType === "text/plain") {
+        const text = message.text;
+
+        // Puan verilen mesajı yakala ve puanı al
+        if (text.includes("has been awarded")) {
+          let puan = 0;
+          let match = text.match(/has been awarded (\d+)/i);
+          if (match) {
+            puan = parseInt(match[1], 10);
+            toplamPuan += puan;
+          }
+          oyunSayaci++;
+          console.log(`✅ Bitirilen oyun sayısı: ${oyunSayaci} | Toplam puan: ${toplamPuan}`);
+          gameOver = true;
+          stopSpamEndGame();
+          stopRandomWordSpam();
+          woCount = 0;
+          lastWoTime = 0;
+          return;
+        }
+
+        // Kazanıldı (puan mesajı gelmediyse de sayaç artsın)
+        if (text.toLowerCase().includes("that's it")) {
+          oyunSayaci++;
+          console.log(`✅ Bitirilen oyun sayısı: ${oyunSayaci} | Toplam puan: ${toplamPuan}`);
+          gameOver = true;
+          stopSpamEndGame();
+          stopRandomWordSpam();
+          await delay(2000);
+          waitingForNewGame = true;
+          await sendGuessWithCooldown("torei");
+          waitingForNewGame = false;
+          gameOver = false;
+          guessCount = 0;
+          lastGuessWord = '';
+          woCount = 0;
+          lastWoTime = 0;
+          return;
+        }
+
+        // Yeni oyun
+        if (text.toLowerCase().includes("a new game has begun")) {
+          waitingForNewGame = false;
+          gameOver = false;
+          guessCount = 0;
+          lastGuessWord = '';
+          stopSpamEndGame();
+          stopRandomWordSpam();
+          woCount = 0;
+          lastWoTime = 0;
+          await sendGuessWithCooldown("torei");
+          return;
+        }
+
+        // Kanal hiç bilemedi
+        if (text.toLowerCase().includes("game over") && text.toLowerCase().includes("the channel failed to guess")) {
+          console.log("💀 Kimse bilemedi. 2 saniye sonra '!wo' gönderiliyor.");
+          await delay(2000);
+          sendGroupMessage(targetGroupId, "!wo");
+          return;
+        }
+      }
+
+      if (message.mimeType === "text/html") {
+        const html = message.text;
+        const board = parseGameBoardFromHTML(html);
+
+        let isEmptyBoard = board.every(row => row.every(cell => cell.status === 'empty' && cell.letter === ''));
+        if (isEmptyBoard) {
+          waitingForNewGame = false;
+          gameOver = false;
+          guessCount = 0;
+          lastGuessWord = '';
+          stopSpamEndGame();
+          stopRandomWordSpam();
+          woCount = 0;
+          lastWoTime = 0;
+          await sendGuessWithCooldown("torei");
+          return;
+        }
+
+        const candidates = filterPossibleWords(board, wordList);
+
+        // Sadece filtrelenmiş kelimeleri göster
+        console.log("Filtrelenmiş kelimeler:", candidates);
+
+        if (candidates.length === 0) {
+          startSpamEndGame();
+          return;
+        } else {
+          stopSpamEndGame();
+          let guess = candidates[0];
+          if (guess === lastGuessWord && candidates.length > 1) {
+            guess = candidates[1];
+          }
+          await sendGuessWithCooldown(guess);
+        }
+      }
+    }
+  });
+
+  resetNoMessageTimer();
+  isListening = true;
+}
