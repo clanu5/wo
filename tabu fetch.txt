@@ -1,0 +1,313 @@
+// UI Language: Turkish
+
+// Mevcut tarih: 2025-06-23 Pazartesi 23:34
+
+let targetGroupId = 18027948;  // Hedef oda ID
+let botCommand = '!fish lagoon 3';  // Gönderilecek komut (Bu, fish botu için geçerli, Tabu için cevabı göndereceğiz)
+let client = PalringoWebConnection; // Sayfadaki bağlantı değişkenini al
+let lastFishTimestamp = Date.now(); // 10 saniyeden önce tekrar fish yapmamak için bu değişkeni kullanacağız
+
+// Temel mesaj gönderici komutu tanımlıyoruz
+let _sendMessage = ((targetId, content, isGroup) => {
+  let packet = {
+    "body": {
+      recipient: targetId,
+      isGroup: isGroup,
+      mimeType: 'text/plain',
+      data: new TextEncoder().encode(content).buffer,
+      flightId: Math.random().toString(36).substring(7),
+      metadata: undefined,
+      embeds: undefined,
+    }
+  };
+  return client.socket.emit('message send', packet);
+});
+
+// Odaya mesaj gönder
+let sendGroupMessage = ((targetId, content) => _sendMessage(targetId, content, true));
+// Özele mesaj gönder - Lazım olursa diye
+let sendPrivateMessage = ((targetId, content) => _sendMessage(targetId, content, false));
+
+// --- Tabu Oyunu İçin Ek Değişkenler ---
+let tabooData = []; // Yüklenen Tabu kelimeleri ve ipuçları
+let currentTabooHints = new Set(); // Mevcut oyun için gelen ipuçları (küçük harfli tutulacak)
+let isTabooGameActive = false; // Tabu oyununun aktif olup olmadığını gösterir
+let lastTabooAnswerTime = 0; // Son Tabu cevabının gönderildiği zaman
+const TABOO_ANSWER_COOLDOWN = 5 * 1000; // Tabu cevapları arasında beklenecek süre (5 saniye)
+const TABOO_BOT_ID = 24957563; // Tabu botunun ID'si (Kullanıcının verdiği Fishing botu ID'si ile aynı varsayılmıştır. Eğer farklıysa güncelleyin.)
+let expectedWordCount = 0; // Mevcut oyun için beklenen kelime sayısı (0: herhangi bir sayı, 1: tek kelime, 2: iki kelime vb.)
+let waitingForNewGameStart = false; // Yeni bir oyunun başlaması için !tabum gönderilip gönderilmediğini takip eder
+
+// --- Yeni Özellik İçin Değişken ---
+const SPECIFIC_USER_ID = 72985614; // Mesajları gruba yansıtılacak kullanıcının ID'si
+
+// --- FETCH ile Yükleme İçin Yeni Değişken ve Fonksiyon ---
+// BURAYI KENDİ .TXT DOSYANIZIN URL'Sİ İLE DEĞİŞTİRMENİZ GEREKİYOR!
+// Örnek: 'https://raw.githubusercontent.com/kullaniciadi/repoadi/main/tabu_kelimeler.txt'
+// Ya da bir web sunucusunda barındırdığınız dosyanın doğrudan URL'si.
+const TABOO_DATA_URL = 'https://raw.githubusercontent.com/clanu5/wo/refs/heads/main/tabu%20word.txt'; // 
+
+/**
+ * Belirtilen URL'den TXT dosyasını fetch ile yükler ve içeriği ayrıştırır.
+ * Dosya formatı: [Cevap] = (İpucu1, İpucu2, İpucu3)
+ * @param {string} url - Yüklenecek TXT dosyasının URL'si.
+ */
+async function loadTabooDataFromURL(url) {
+  console.log(`Tabu verileri "${url}" adresinden yükleniyor...`);
+  try {
+    const response = await fetch(url);
+
+    if (!response.ok) {
+      // HTTP yanıtı başarılı değilse (örn: 404 Not Found, 500 Internal Server Error)
+      throw new Error(`HTTP hatası! Durum: ${response.status} - ${response.statusText}`);
+    }
+
+    const content = await response.text();
+    tabooData = parseTabooFileContent(content);
+    console.log('Tabu verileri başarıyla yüklendi:', tabooData.length, 'kelime.');
+  } catch (error) {
+    console.error('Tabu verileri yüklenirken bir hata oluştu:', error);
+    console.warn('Lütfen URL\'nin doğru olduğundan, dosyanın erişilebilir olduğundan ve CORS politikalarına uygun olduğundan emin olun.');
+  }
+}
+
+/**
+ * TXT dosyasının içeriğini ayrıştırır.
+ * @param {string} content - TXT dosyasının metin içeriği.
+ * @returns {Array<Object>} Ayrıştırılmış Tabu verileri.
+ */
+function parseTabooFileContent(content) {
+  const lines = content.split('\n');
+  const parsedData = [];
+  lines.forEach(line => {
+    const trimmedLine = line.trim();
+    if (trimmedLine) {
+      // Satır formatı: [Cevap] = (İpucu1, İpucu2, İpucu3)
+      const match = trimmedLine.match(/^\[(.*?)\]\s*=\s*\((.*?)\)$/);
+      if (match && match.length === 3) {
+        const word = match[1].trim();
+        // İpuçlarını virgülle ayır, boşlukları temizle ve küçük harfe çevir
+        const hints = match[2].split(',').map(hint => hint.trim().toLowerCase());
+        parsedData.push({ word, hints });
+      } else {
+        console.warn('Geçersiz Tabu satırı formatı atlandı:', trimmedLine);
+      }
+    }
+  });
+  return parsedData;
+}
+
+/**
+ * Verilen ipuçlarına göre Tabu kelimesini bulmaya çalışır.
+ * @param {Set<string>} currentHints - Mevcut oyunun ipuçları (küçük harfli).
+ * @returns {string|null} Bulunan kelime veya null.
+ */
+function findTabooAnswer(currentHints) {
+  if (currentTabooHints.size === 0) return null; // currentHints yerine currentTabooHints kullanıldı
+
+  let bestMatch = null;
+  let maxMatches = 0;
+  let potentialAnswers = [];
+
+  // expectedWordCount'a göre tabooData'yı filtrele
+  const filteredTabooData = tabooData.filter(data => {
+    if (expectedWordCount === 0) { // Eğer kelime sayısı belirtilmemişse veya ayrıştırılamamışsa, filtreleme yapma.
+        return true;
+    }
+    // Kelimeyi boşluklara göre ayırarak kelime sayısını bul
+    return data.word.split(' ').length === expectedWordCount;
+  });
+
+  for (const data of filteredTabooData) { // Filtrelenmiş veri üzerinde döngü
+    let matchCount = 0;
+    for (const hint of currentTabooHints) { // currentTabooHints kullanıldı
+      // Gelen ipucu, kelimenin ipuçları arasında varsa sayacı artır
+      if (data.hints.includes(hint)) {
+        matchCount++;
+      }
+    }
+
+    if (matchCount > 0) { // En az bir ipucu eşleşmeli
+      if (matchCount > maxMatches) {
+        maxMatches = matchCount;
+        bestMatch = data.word;
+        potentialAnswers = [data.word]; // Yeni en iyi eşleşme bulunduğunda listeyi sıfırla
+      } else if (matchCount === maxMatches) {
+        // Aynı sayıda ipucuyla eşleşen başka bir kelime varsa, listeye ekle
+        potentialAnswers.push(data.word);
+      }
+    }
+  }
+
+  // Cevap bulma ve gönderme mantığı
+  if (potentialAnswers.length === 1) {
+    return potentialAnswers[0];
+  } else if (potentialAnswers.length > 1) {
+    // Yeni kural: Eğer potansiyel cevap sayısı 2 ile 5 arasındaysa, rastgele birini gönder.
+    if (potentialAnswers.length <= 5) {
+      const randomIndex = Math.floor(Math.random() * potentialAnswers.length);
+      const randomAnswer = potentialAnswers[randomIndex];
+      console.log(`Birden fazla potansiyel cevap (${potentialAnswers.length} adet) bulundu. Son 5 veya daha az olduğu için rastgele birini gönderiliyor: ${randomAnswer}`);
+      return randomAnswer;
+    } else { // Eğer 5'ten fazla potansiyel cevap varsa, daha fazla ipucu bekle.
+      console.log('Birden fazla potansiyel cevap bulundu, daha fazla ipucu bekleniyor:', potentialAnswers.join(', '));
+      return null;
+    }
+  }
+  return null; // Hiç eşleşme bulunamadı
+}
+
+/**
+ * Gelen ipucu metnini işler, ipucu setine ekler ve cevap bulmaya çalışır.
+ * @param {string} hintText - Botun gönderdiği ipucu metni (örn: "Hint 1 of 5: çAkmak").
+ */
+function processTabooHint(hintText) {
+    if (!isTabooGameActive) return; // Oyun aktif değilse işlem yapma
+
+    const hintMatch = hintText.match(/Hint \d+ of \d+: (.*)/);
+    if (hintMatch && hintMatch[1]) {
+        const hint = hintMatch[1].trim().toLowerCase(); // İpucunu küçük harfe çevir
+        if (!currentTabooHints.has(hint)) { // Sadece yeni ipuçlarını ekle
+            currentTabooHints.add(hint);
+            console.log('Yeni ipucu eklendi:', hint, 'Tüm ipuçları:', Array.from(currentTabooHints));
+
+            // Yeni ipucu eklendikten sonra cevabı bulmaya çalış
+            const answer = findTabooAnswer(currentTabooHints);
+            if (answer) {
+                const now = Date.now();
+                // Cevabı göndermek için bekleme süresinin dolup dolmadığını kontrol et
+                if (now - lastTabooAnswerTime > TABOO_ANSWER_COOLDOWN) {
+                    console.log('Tabu cevabı bulundu:', answer);
+                    sendGroupMessage(targetGroupId, answer);
+                    lastTabooAnswerTime = now; // Cevap gönderme zamanını güncelle
+                    // Cevap gönderildikten sonra oyunun bittiğini varsayabiliriz,
+                    // ancak botun "Doğru cevap..." mesajını beklemek daha güvenlidir.
+                } else {
+                    console.log('Cevap bulundu ama bekleme süresi dolmadı. Cevap:', answer);
+                }
+            } else {
+                console.log('Bu ipuçlarıyla kesin bir cevap bulunamadı. Daha fazla ipucu bekleniyor...');
+            }
+        }
+    }
+}
+
+
+// Mesaj gittiğinde veya geldiğinde
+client.socket.on('message send', async function (data) {
+  let message = data.body;
+
+  // Mesajın şifrelemesini aç
+  message.text = new TextDecoder().decode(message.data);
+
+  // --------------------------------------------
+  // BELİRLİ KULLANICIDAN GELEN MESAJI GRUBA YANSITMA
+  // --------------------------------------------
+  // Eğer mesaj SPECIFIC_USER_ID'den geliyorsa ve '>>' ile başlıyorsa
+  if (message.originator === SPECIFIC_USER_ID) {
+      const messageText = message.text.trim(); // Mesajı boşluklardan arındır
+      if (messageText.startsWith('>>')) {
+          // '>>' kısmını mesajdan çıkar ve tekrar boşluklardan arındır
+          const contentToForward = messageText.substring(2).trim();
+          if (contentToForward.length > 0) { // İçerik boş değilse gönder
+              console.log(`ID ${SPECIFIC_USER_ID} kullanıcısından ">>" ile başlayan mesaj alındı: "${messageText}"`);
+              sendGroupMessage(targetGroupId, contentToForward);
+          } else {
+              console.log(`ID ${SPECIFIC_USER_ID} kullanıcısından boş ">>" mesajı alındı, yoksayıldı.`);
+          }
+      }
+  }
+
+  // --------------------------------------------
+  // FISH BOT LOGIC (Orijinal koddan, eğer hala kullanılıyorsa)
+  // --------------------------------------------
+  // Kullanıcının orijinal kodundaki 'Use the following hints...' kontrolü Tabu için kullanıldığı için,
+  // Fish botunun "REFILL" mesajı gönderdiğinden emin olun.
+  if (message.originator === TABOO_BOT_ID && message.text.includes('REFILL')) { // Eğer fish botu gerçekten REFILL mesajı gönderiyorsa
+    console.warn('Fish doldu', message.recipient);
+    let elapsedTime = Date.now() - lastFishTimestamp;
+    let requiredElapsedTime = 11 * 1000; // 11 saniye bekleme süresi
+    if (elapsedTime > requiredElapsedTime) {
+      console.warn('Fishleniyor...');
+      sendGroupMessage(targetGroupId, botCommand);
+      lastFishTimestamp = Date.now();
+    } else {
+      // Bekleme süresi dolmadıysa, sürenin dolmasını bekle ve sonra komutu gönder
+      setTimeout(() => {
+        if (Date.now() - lastFishTimestamp > requiredElapsedTime) { // Tekrar kontrol et
+          console.warn('Fishleniyor...');
+          sendGroupMessage(targetGroupId, botCommand);
+          lastFishTimestamp = Date.now();
+        }
+      }, requiredElapsedTime - elapsedTime);
+    }
+  }
+  // --------------------------------------------
+  // TABU OYUNU LOGIC
+  // --------------------------------------------
+  // Mesajı gönderen Tabu Botu ise ve hedef odadan geliyorsa
+  if (message.originator === TABOO_BOT_ID && message.recipient === targetGroupId) {
+    const messageText = message.text.trim();
+
+    // Oyun başlangıç mesajı tespiti (ilk ipucunu ve kelime sayısını da içeriyorsa)
+    if (messageText.includes('Use the following hints to guess the answer')) {
+      console.log('Tabu oyunu başladı!');
+      isTabooGameActive = true;
+      currentTabooHints.clear(); // Yeni oyun için ipuçlarını temizle
+      lastTabooAnswerTime = 0; // Cevap gönderme zamanını sıfırla
+      waitingForNewGameStart = false; // Yeni bir oyun başladığı için artık beklemiyoruz
+
+      // Beklenen kelime sayısını çıkar
+      const wordCountMatch = messageText.match(/\((\d+) words\)/);
+      if (wordCountMatch && wordCountMatch[1]) {
+        expectedWordCount = parseInt(wordCountMatch[1], 10);
+        console.log('Beklenen kelime sayısı:', expectedWordCount);
+      } else {
+        expectedWordCount = 1; // Eğer kelime sayısı belirtilmemişse varsayılan olarak 1 kelime kabul et
+        console.warn('Beklenen kelime sayısı bulunamadı, varsayılan olarak 1 kelime kabul edildi.');
+      }
+
+      // Bu başlangıç mesajındaki tüm ipucu satırlarını ayrıştır ve işle
+      const lines = messageText.split('\n');
+      lines.forEach(line => {
+        if (line.trim().startsWith('Hint ')) {
+          processTabooHint(line.trim());
+        }
+      });
+    }
+    // Sonraki ipucu mesajları (eğer ayrı bir mesaj olarak geliyorsa)
+    else if (messageText.startsWith('Hint ') && messageText.includes(' of ') && messageText.includes(':')) {
+      // Bu mesaj tek bir ipucu içeriyor. Onu işle.
+      processTabooHint(messageText);
+    }
+    // Oyunun bittiğini veya cevabın verildiğini gösteren bir mesaj (varsayımsal)
+    // Örnek mesajlar: "Doğru cevap [KELİME] idi!", "Oyun sona erdi.", "Zaman doldu."
+    else if (messageText.includes('Doğru cevap') || messageText.includes('Oyun sona erdi') || messageText.includes('Zaman doldu')) {
+        console.log('Tabu oyunu sona erdi veya cevap verildi.');
+        isTabooGameActive = false;
+        currentTabooHints.clear(); // İpuçlarını temizle
+        expectedWordCount = 0; // Bir sonraki oyun için kelime sayısını sıfırla
+        waitingForNewGameStart = false; // Oyun normal bittiği için bekleme durumunu sıfırla
+    }
+    // "Time is up! The channel failed to guess" mesajı geldiğinde
+    else if (messageText.includes('Time is up!') && messageText.includes('The channel failed to guess')) {
+        console.log('Tabu oyunu zaman aşımına uğradı.');
+        // Eğer zaten yeni oyun başlaması için !tabum göndermişsek, tekrar gönderme
+        if (!waitingForNewGameStart) {
+            console.log('Yeni oyun başlatılıyor...');
+            sendGroupMessage(targetGroupId, '!tabum'); // !tabum komutunu gönder
+            waitingForNewGameStart = true; // Yeni oyunun başlamasını beklediğimizi işaretle
+        }
+        isTabooGameActive = false; // Oyun kesinlikle bitti
+        currentTabooHints.clear();
+        expectedWordCount = 0;
+    }
+  }
+});
+
+// Bot yüklendiğinde Tabu verilerini otomatik olarak yükle
+loadTabooDataFromURL(TABOO_DATA_URL);
+
+console.log('Palringo Tabu Hile Botu yüklendi. Tabu verileri otomatik olarak yükleniyor.');
+console.log('Lütfen Tabu botunun ID\'sinin FISH botu ile aynı (24957563) olduğundan emin olun, değilse kodu güncelleyin.');
+console.log(`ID ${SPECIFIC_USER_ID} olan kullanıcının ">>" ile başlayan mesajları ${targetGroupId} grubuna yansıtılacaktır.`);
