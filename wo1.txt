@@ -3,7 +3,7 @@ let wordList = [];
 
 async function yasuo() {
   try {
-    const response = await fetch('https://raw.githubusercontent.com/clanu5/jockey-cheat/refs/heads/main/5%20harf%20%20(1).txt'); // Kelime listesinin URL'si
+    const response = await fetch('https://raw.githubusercontent.com/clanu5/jockey-cheat/refs/heads/main/5.txt'); // Kelime listesinin URL'si
     if (!response.ok) throw new Error(`HTTP ${response.status}: ${response.statusText}`);
     const text = await response.text();
     wordList = text
@@ -329,3 +329,4 @@ if (!isListening) {
   resetNoMessageTimer();
   isListening = true;
 }
+
